@@ -51,13 +51,13 @@ function provisioning_start() {
     provisioning_get_nodes
     provisioning_get_pip_packages
     provisioning_get_models \
-        "opt/ComfyUI/models/diffusion_models/mochi" \
+        "${WORKSPACE}/storage/stable_diffusion/models/diffusion_models/mochi" \
         "${DIFFUSION_MODELS[@]}"
     provisioning_get_models \
-        "opt/ComfyUI/models/vae/mochi" \
+        "${WORKSPACE}/storage/stable_diffusion/models/vae/mochi" \
         "${VAEMODELS[@]}"
     provisioning_get_models \
-        "opt/ComfyUI/models/clip" \
+        "${WORKSPACE}/storage/stable_diffusion/models/clip" \
         "${CLIP_MODELS[@]}"
     provisioning_print_end
 }
