@@ -103,7 +103,7 @@ class AsymmetricAttention(nn.Module):
             if update_y
             else nn.Identity()
         )
-
+    
     def run_qkv_y(self, y):
         cp_rank, cp_size = get_cp_rank_size()
         local_heads = self.num_heads // cp_size
@@ -172,14 +172,17 @@ class AsymmetricAttention(nn.Module):
         return qkv
     
     def flash_attention(self, qkv, cu_seqlens, max_seqlen_in_batch, total, local_dim):
-        with torch.autocast("cuda", enabled=False):
-            out: torch.Tensor = flash_attn_varlen_qkvpacked_func(
+        # Optimisé pour bf16
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            out = flash_attn_varlen_qkvpacked_func(
                 qkv,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen_in_batch,
                 dropout_p=0.0,
                 softmax_scale=self.softmax_scale,
-            )  # (total, local_heads, head_dim)
+                causal=False,
+                return_attn_probs=False
+            )
             return out.view(total, local_dim)
         
     def sdpa_attention(self, qkv):
@@ -709,3 +712,4 @@ class AsymmDiTJoint(nn.Module):
         )
 
         return x
+

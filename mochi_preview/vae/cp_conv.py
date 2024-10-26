@@ -95,9 +95,8 @@ def gather_all_frames(x: torch.Tensor) -> torch.Tensor:
     return torch.cat(gathered_x, dim=2)
 
 
-def excessive_memory_usage(input: torch.Tensor, max_gb: float = 2.0) -> bool:
-    """Estimate memory usage based on input tensor size and data type."""
-    element_size = input.element_size()  # Size in bytes of each element
+def excessive_memory_usage(input: torch.Tensor, max_gb: float = 40.0) -> bool:
+    element_size = input.element_size()
     memory_bytes = input.numel() * element_size
     memory_gb = memory_bytes / 1024**3
     return memory_gb > max_gb
@@ -150,3 +149,4 @@ class ContextParallelCausalConv3d(torch.nn.Conv3d):
         x_chunks = x.tensor_split(cp_world_size, dim=2)
         assert len(x_chunks) == cp_world_size
         return x_chunks[cp_rank]
+

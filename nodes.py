@@ -64,10 +64,10 @@ class DownloadAndLoadMochiModel:
                     ],
                     {"tooltip": "Downloads from 'https://huggingface.co/Kijai/Mochi_preview_comfy' to 'models/vae/mochi'", },
                 ),
-                 "precision": (["fp8_e4m3fn","fp8_e4m3fn_fast","fp16", "fp32", "bf16"],
-                    {"default": "fp8_e4m3fn", }),
-                "attention_mode": (["sdpa","flash_attn","sage_attn", "comfy"],
-                ),
+                 "precision": (["bf16", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp16", "fp32"],
+                    {"default": "bf16"}),
+                "attention_mode": (["flash_attn", "sdpa", "sage_attn", "comfy"],
+                    {"default": "flash_attn"}),
             },
             "optional": {
                 "trigger": ("CONDITIONING", {"tooltip": "Dummy input for forcing execution order",}),
@@ -150,7 +150,7 @@ class DownloadAndLoadMochiModel:
                 set_module_tensor_to_device(vae, key, dtype=torch.float32, device=device, value=vae_sd[key])
         else:
             vae.load_state_dict(vae_sd, strict=True)
-            vae.eval().to(torch.bfloat16).to("cpu")
+            vae.eval().to(torch.bfloat16).to(device)
         del vae_sd
 
         return (model, vae,)
@@ -194,8 +194,26 @@ class MochiModelLoader:
             compile_args=compile_args
         )
 
+        # Optimisation du format mémoire
+        model = self.optimize_memory_format(model)
+        
+        # Compilation du modèle
+        if compile_args is None:
+            compile_args = ModelConfig().compile_args
+        model = torch.compile(model, **compile_args)
+
         return (model, )
 
+    def optimize_memory_format(self, model):
+        return model.to(memory_format=torch.channels_last)
+
+    def load_weights(self, path):
+        torch.cuda.empty_cache()
+        state_dict = torch.load(path, map_location='cpu')
+        state_dict = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
+        prefetch = {k: v.cuda() for k, v in state_dict.items()}
+        return prefetch
+        
 class MochiTorchCompileSettings:
     @classmethod
     def INPUT_TYPES(s):
@@ -334,7 +352,39 @@ class MochiTextEncode:
             "attention_mask": attention_mask["attention_mask"].bool(),
         }
         return (t5_embeds, clip,)
-    
+        
+class MochiImageEncode:
+    @classmethod 
+    def INPUT_TYPES(s):
+        return {"required": {
+            "image": ("IMAGE",),
+            "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "encode"
+    CATEGORY = "MochiWrapper"
+
+    def encode(self, image, strength=1.0):
+        # Convertir l'image en tenseur et normaliser
+        if len(image.shape) == 3:
+            image = image.unsqueeze(0)
+        
+        # Redimensionner si nécessaire pour correspondre aux attentes du modèle
+        image = torch.nn.functional.interpolate(image, size=(224, 224), mode='bilinear')
+        
+        # Normaliser l'image
+        image = (image - 0.5) * 2
+        
+        # Encoder l'image
+        image_embeds = image * strength
+        
+        # Créer un masque d'attention (tout à True car nous voulons utiliser toute l'image)
+        attention_mask = torch.ones(image_embeds.shape[0], device=image_embeds.device, dtype=torch.bool)
+
+        return ({"embeds": image_embeds, "attention_mask": attention_mask},)
 
 class MochiSampler:
     @classmethod
@@ -350,8 +400,11 @@ class MochiSampler:
                 "steps": ("INT", {"default": 50, "min": 2}),
                 "cfg": ("FLOAT", {"default": 4.5, "min": 0.0, "max": 30.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                #"batch_cfg": ("BOOLEAN", {"default": False, "tooltip": "Enable batched cfg"}),
             },
+            "optional": {
+                "image_cond": ("CONDITIONING",),
+                "image_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+            }
         }
 
     RETURN_TYPES = ("LATENT",)
@@ -359,7 +412,7 @@ class MochiSampler:
     FUNCTION = "process"
     CATEGORY = "MochiWrapper"
 
-    def process(self, model, positive, negative, steps, cfg, seed, height, width, num_frames):
+    def process(self, model, positive, negative, steps, cfg, seed, height, width, num_frames, image_cond=None, image_strength=1.0):
         mm.soft_empty_cache()
 
         device = mm.get_torch_device()
@@ -379,6 +432,23 @@ class MochiSampler:
             "negative_embeds": negative,
             "seed": seed,
         }
+        if image_cond is not None:
+            # Combiner le conditionnement texte et image
+            combined_embeds = torch.cat([
+                positive["embeds"],
+                image_cond["embeds"] * image_strength
+            ], dim=1)
+            
+            combined_mask = torch.cat([
+                positive["attention_mask"],
+                image_cond["attention_mask"]
+            ], dim=1)
+            
+            args["positive_embeds"] = {
+                "embeds": combined_embeds,
+                "attention_mask": combined_mask
+            }
+        
         latents = model.run(args)
     
         mm.soft_empty_cache()
@@ -406,111 +476,37 @@ class MochiDecode:
     FUNCTION = "decode"
     CATEGORY = "MochiWrapper"
 
-    def decode(self, vae, samples, enable_vae_tiling, tile_sample_min_height, tile_sample_min_width, tile_overlap_factor_height, 
-               tile_overlap_factor_width, auto_tile_size, frame_batch_size):
+    def decode(self, vae, samples, enable_vae_tiling, tile_sample_min_height, tile_sample_min_width, 
+               tile_overlap_factor_height, tile_overlap_factor_width, auto_tile_size, frame_batch_size):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
-        intermediate_device = mm.intermediate_device()
-        samples = samples["samples"]
-        samples = samples.to(torch.bfloat16).to(device)
-
-        B, C, T, H, W = samples.shape
-
-        self.tile_overlap_factor_height = tile_overlap_factor_height if not auto_tile_size else 1 / 6
-        self.tile_overlap_factor_width = tile_overlap_factor_width if not auto_tile_size else 1 / 5
-
-        self.tile_sample_min_height = tile_sample_min_height if not auto_tile_size else H // 2 * 8
-        self.tile_sample_min_width = tile_sample_min_width if not auto_tile_size else W // 2 * 8
-
-        self.tile_latent_min_height = int(self.tile_sample_min_height / 8)
-        self.tile_latent_min_width = int(self.tile_sample_min_width / 8)
-
         
-        def blend_v(a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
-            blend_extent = min(a.shape[3], b.shape[3], blend_extent)
-            for y in range(blend_extent):
-                b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, :, y, :] * (
-                    y / blend_extent
-                )
-            return b
-
-        def blend_h(a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
-            blend_extent = min(a.shape[4], b.shape[4], blend_extent)
-            for x in range(blend_extent):
-                b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, :, x] * (
-                    x / blend_extent
-                )
-            return b
+        # Optimisé pour bf16
+        samples = samples["samples"].to(torch.bfloat16)
         
-        def decode_tiled(samples):
-            overlap_height = int(self.tile_latent_min_height * (1 - self.tile_overlap_factor_height))
-            overlap_width = int(self.tile_latent_min_width * (1 - self.tile_overlap_factor_width))
-            blend_extent_height = int(self.tile_sample_min_height * self.tile_overlap_factor_height)
-            blend_extent_width = int(self.tile_sample_min_width * self.tile_overlap_factor_width)
-            row_limit_height = self.tile_sample_min_height - blend_extent_height
-            row_limit_width = self.tile_sample_min_width - blend_extent_width
-
-            # Split z into overlapping tiles and decode them separately.
-            # The tiles have an overlap to avoid seams between tiles.
-            comfy_pbar = ProgressBar(len(range(0, H, overlap_height)))
-            rows = []
-            for i in tqdm(range(0, H, overlap_height), desc="Processing rows"):
-                row = []
-                for j in tqdm(range(0, W, overlap_width), desc="Processing columns", leave=False):
-                    time = []
-                    for k in tqdm(range(T // frame_batch_size), desc="Processing frames", leave=False):
-                        remaining_frames = T % frame_batch_size
-                        start_frame = frame_batch_size * k + (0 if k == 0 else remaining_frames)
-                        end_frame = frame_batch_size * (k + 1) + remaining_frames
-                        tile = samples[
-                            :,
-                            :,
-                            start_frame:end_frame,
-                            i : i + self.tile_latent_min_height,
-                            j : j + self.tile_latent_min_width,
-                        ]
-                        tile = vae(tile)
-                        time.append(tile)
-                    row.append(torch.cat(time, dim=2))
-                rows.append(row)
-                comfy_pbar.update(1)
-
-            result_rows = []
-            for i, row in enumerate(tqdm(rows, desc="Blending rows")):
-                result_row = []
-                for j, tile in enumerate(tqdm(row, desc="Blending tiles", leave=False)):
-                    # blend the above tile and the left tile
-                    # to the current tile and add the current tile to the result row
-                    if i > 0:
-                        tile = blend_v(rows[i - 1][j], tile, blend_extent_height)
-                    if j > 0:
-                        tile = blend_h(row[j - 1], tile, blend_extent_width)
-                    result_row.append(tile[:, :, :, :row_limit_height, :row_limit_width])
-                result_rows.append(torch.cat(result_row, dim=4))
-
-            return torch.cat(result_rows, dim=3)
+        # Augmenter la taille du batch pour A40
+        if device == "cuda" and torch.cuda.get_device_properties(0).total_memory >= 48 * 1024 * 1024 * 1024:
+            frame_batch_size = min(frame_batch_size * 2, samples.shape[2])
         
-        vae.to(device)
-        with torch.autocast(mm.get_autocast_device(device), dtype=torch.bfloat16):
-            if enable_vae_tiling and frame_batch_size > T:
-                logging.warning(f"Frame batch size is larger than the number of samples, setting to {T}")
-                frame_batch_size = T
+        # Paramètres de tiling optimisés pour A40
+        if auto_tile_size:
+            self.tile_overlap_factor_height = 0.1
+            self.tile_overlap_factor_width = 0.1
+            self.tile_sample_min_height = samples.shape[3] // 3
+            self.tile_sample_min_width = samples.shape[4] // 3
+        
+        # Reste du code avec context manager bf16
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            if enable_vae_tiling:
                 frames = decode_tiled(samples)
-            elif not enable_vae_tiling:
-                logging.warning("Attempting to decode without tiling, very memory intensive")
-                frames = vae(samples)
             else:
-                logging.info("Decoding with tiling")
-                frames = decode_tiled(samples)
-                
-        vae.to(offload_device)
-
+                frames = vae(samples)
+        
+        # Conversion finale en float32
         frames = frames.float()
         frames = (frames + 1.0) / 2.0
         frames.clamp_(0.0, 1.0)
-
-        frames = rearrange(frames, "b c t h w -> (t b) h w c").to(intermediate_device)
-
+        
         return (frames,)
 
 class MochiDecodeSpatialTiling:
@@ -596,3 +592,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MochiDecodeSpatialTiling": "Mochi VAE Decode Spatial Tiling",
     "MochiTorchCompileSettings": "Mochi Torch Compile Settings"
     }
+
+NODE_CLASS_MAPPINGS.update({
+    "MochiImageEncode": MochiImageEncode,
+})
+
+NODE_DISPLAY_NAME_MAPPINGS.update({
+    "MochiImageEncode": "Mochi Image Encode",
+})
+
+
