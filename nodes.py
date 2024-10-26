@@ -213,7 +213,7 @@ class MochiModelLoader:
         state_dict = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
         prefetch = {k: v.cuda() for k, v in state_dict.items()}
         return prefetch
-        
+
 class MochiTorchCompileSettings:
     @classmethod
     def INPUT_TYPES(s):
@@ -310,49 +310,70 @@ class MochiTextEncode:
     def INPUT_TYPES(s):
         return {"required": {
             "clip": ("CLIP",),
-            "prompt": ("STRING", {"default": "", "multiline": True} ),
-            },
-            "optional": {
-                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
-                "force_offload": ("BOOLEAN", {"default": True}),
-            }
-        }
+            "prompt": ("STRING", {"multiline": True}),
+            "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+            "force_offload": ("BOOLEAN", {"default": True}),
+        }}
 
-    RETURN_TYPES = ("CONDITIONING", "CLIP",)
-    RETURN_NAMES = ("conditioning", "clip", )
+    RETURN_TYPES = ("CONDITIONING", "CLIP")
     FUNCTION = "process"
     CATEGORY = "MochiWrapper"
 
     def process(self, clip, prompt, strength=1.0, force_offload=True):
+        load_device = "cpu"  # Forcer le chargement sur CPU
         max_tokens = 256
-        load_device = mm.text_encoder_device()
-        offload_device = mm.text_encoder_offload_device()
-
-        clip.tokenizer.t5xxl.pad_to_max_length = True
-        clip.tokenizer.t5xxl.max_length = max_tokens
-        clip.cond_stage_model.t5xxl.return_attention_masks = True
-        clip.cond_stage_model.t5xxl.enable_attention_masks = True
-        clip.cond_stage_model.t5_attention_mask = True
-        clip.cond_stage_model.to(load_device)
-        tokens = clip.tokenizer.t5xxl.tokenize_with_weights(prompt, return_word_ids=True)
         
         try:
-            embeds, _, attention_mask = clip.cond_stage_model.t5xxl.encode_token_weights(tokens)
-        except:
-            NotImplementedError("Failed to get attention mask from T5, is your ComfyUI up to date?")
+            # Configuration du tokenizer
+            clip.tokenizer.t5xxl.pad_to_max_length = True
+            clip.tokenizer.t5xxl.max_length = max_tokens
+            
+            # Tokenization sur CPU
+            tokens = clip.tokenizer.t5xxl.tokenize_with_weights(prompt, return_word_ids=True)
+            
+            # Encodage par morceaux
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                # Garder le modèle sur CPU
+                clip.cond_stage_model.to(load_device)
+                
+                # Traiter par petits lots
+                batch_size = 32
+                embeds_list = []
+                attention_masks = []
+                
+                for i in range(0, len(tokens), batch_size):
+                    batch_tokens = tokens[i:i + batch_size]
+                    with torch.no_grad():
+                        batch_embeds, _, batch_mask = clip.cond_stage_model.t5xxl.encode_token_weights(batch_tokens)
+                        embeds_list.append(batch_embeds.cpu())
+                        attention_masks.append(batch_mask["attention_mask"].cpu())
+                
+                # Concaténer les résultats
+                embeds = torch.cat(embeds_list, dim=1)
+                attention_mask = torch.cat(attention_masks, dim=1)
+                
+                # Vérification de la longueur
+                if embeds.shape[1] > max_tokens:
+                    embeds = embeds[:, :max_tokens]
+                    attention_mask = attention_mask[:, :max_tokens]
+                
+                # Application de la force
+                embeds = embeds * strength
+                
+                # Préparation du résultat
+                t5_embeds = {
+                    "embeds": embeds,
+                    "attention_mask": attention_mask.bool()
+                }
+                
+                return (t5_embeds, clip)
+                
+        except Exception as e:
+            if force_offload:
+                clip.cond_stage_model.to("cpu")
+                torch.cuda.empty_cache()
+            raise e
 
-        if embeds.shape[1] > 256:
-            raise ValueError(f"Prompt is too long, max tokens supported is {max_tokens} or less, got {embeds.shape[1]}")
-        embeds *= strength
-        if force_offload:
-            clip.cond_stage_model.to(offload_device)
-
-        t5_embeds = {
-            "embeds": embeds,
-            "attention_mask": attention_mask["attention_mask"].bool(),
-        }
-        return (t5_embeds, clip,)
-        
 class MochiImageEncode:
     @classmethod 
     def INPUT_TYPES(s):
@@ -509,6 +530,168 @@ class MochiDecode:
         
         return (frames,)
 
+class OptimizedMochiDecode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "vae": ("MOCHIVAE",),
+            "samples": ("LATENT",),
+            "enable_vae_tiling": ("BOOLEAN", {"default": True}),
+            "frame_batch_size": ("INT", {"default": 8, "min": 1, "max": 32}),
+            "tile_method": (["uniform", "adaptive", "dynamic"], {"default": "adaptive"}),
+            "memory_efficient": ("BOOLEAN", {"default": True}),
+            "precision": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
+        }}
+    
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "decode"
+    CATEGORY = "MochiWrapper"
+
+    def decode(self, vae, samples, enable_vae_tiling, frame_batch_size, 
+               tile_method, memory_efficient, precision):
+        device = mm.get_torch_device()
+        
+        # Configuration de la précision
+        dtype_map = {
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+            "fp32": torch.float32
+        }
+        dtype = dtype_map[precision]
+        
+        # Gestion adaptative de la mémoire
+        available_memory = self._get_available_memory()
+        optimal_batch_size = self._calculate_optimal_batch_size(
+            samples.shape, 
+            available_memory
+        )
+        frame_batch_size = min(frame_batch_size, optimal_batch_size)
+
+        # Préparation des échantillons
+        samples = samples["samples"].to(dtype)
+        total_frames = samples.shape[2]
+        
+        # Initialisation du buffer de sortie
+        output_frames = []
+        
+        # Context manager pour la gestion mémoire
+        with torch.cuda.amp.autocast(dtype=dtype):
+            for frame_idx in range(0, total_frames, frame_batch_size):
+                # Traitement par lots
+                batch_end = min(frame_idx + frame_batch_size, total_frames)
+                current_batch = samples[:, :, frame_idx:batch_end]
+                
+                if enable_vae_tiling:
+                    # Sélection de la méthode de tiling
+                    if tile_method == "adaptive":
+                        decoded_batch = self._adaptive_tiled_decode(
+                            vae, 
+                            current_batch,
+                            memory_efficient
+                        )
+                    elif tile_method == "dynamic":
+                        decoded_batch = self._dynamic_tiled_decode(
+                            vae, 
+                            current_batch,
+                            available_memory
+                        )
+                    else:  # uniform
+                        decoded_batch = self._uniform_tiled_decode(
+                            vae, 
+                            current_batch
+                        )
+                else:
+                    decoded_batch = vae(current_batch)
+                
+                # Optimisation mémoire
+                if memory_efficient:
+                    decoded_batch = decoded_batch.cpu()
+                    torch.cuda.empty_cache()
+                
+                output_frames.append(decoded_batch)
+        
+        # Assemblage final
+        frames = torch.cat(output_frames, dim=0)
+        frames = frames.float()
+        frames = (frames + 1.0) / 2.0
+        frames.clamp_(0.0, 1.0)
+        
+        return (frames,)
+
+    def _adaptive_tiled_decode(self, vae, batch, memory_efficient):
+        """Décodage avec taille de tuile adaptative basée sur le contenu"""
+        # Analyse du contenu pour déterminer les zones complexes
+        complexity_map = self._calculate_complexity_map(batch)
+        
+        # Ajustement dynamique de la taille des tuiles
+        tile_sizes = self._get_adaptive_tile_sizes(complexity_map)
+        
+        decoded_tiles = []
+        for tile_size in tile_sizes:
+            tile = self._extract_tile(batch, tile_size)
+            decoded_tile = vae(tile)
+            
+            if memory_efficient:
+                decoded_tile = decoded_tile.cpu()
+            
+            decoded_tiles.append(decoded_tile)
+        
+        return self._merge_tiles(decoded_tiles)
+
+    def _dynamic_tiled_decode(self, vae, batch, available_memory):
+        """Décodage avec ajustement dynamique basé sur la mémoire disponible"""
+        # Calcul de la taille optimale des tuiles basé sur la mémoire
+        tile_size = self._calculate_optimal_tile_size(
+            batch.shape, 
+            available_memory
+        )
+        
+        # Découpage en tuiles avec chevauchement
+        tiles = self._split_into_tiles(batch, tile_size)
+        
+        # Décodage progressif
+        decoded_tiles = []
+        for tile in tiles:
+            decoded_tile = vae(tile)
+            decoded_tiles.append(decoded_tile)
+            
+            # Libération mémoire si nécessaire
+            if len(decoded_tiles) > 2:
+                decoded_tiles[0] = decoded_tiles[0].cpu()
+        
+        return self._blend_tiles(decoded_tiles)
+
+    def _calculate_complexity_map(self, batch):
+        """Calcule une carte de complexité pour le batch"""
+        with torch.no_grad():
+            # Utilisation de gradients de Sobel pour détecter les zones complexes
+            dx = torch.abs(batch[:, :, 1:] - batch[:, :, :-1])
+            dy = torch.abs(batch[:, :, :, 1:] - batch[:, :, :, :-1])
+            
+            complexity = (dx.mean(1) + dy.mean(1)) / 2
+            return F.interpolate(complexity, scale_factor=0.25)
+
+    def _get_available_memory(self):
+        """Obtient la mémoire GPU disponible"""
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            return torch.cuda.get_device_properties(device).total_memory - \
+                   torch.cuda.memory_allocated(device)
+        return None
+
+    def _calculate_optimal_batch_size(self, input_shape, available_memory):
+        """Calcule la taille de batch optimale basée sur la mémoire disponible"""
+        if available_memory is None:
+            return 8  # Taille par défaut
+            
+        # Estimation de la mémoire nécessaire par frame
+        memory_per_frame = np.prod(input_shape[1:]) * 4  # 4 bytes pour float32
+        
+        # Ajout d'une marge de sécurité (20%)
+        safe_memory = available_memory * 0.8
+        
+        return max(1, int(safe_memory // memory_per_frame))
+
 class MochiDecodeSpatialTiling:
     @classmethod
     def INPUT_TYPES(s):
@@ -576,6 +759,7 @@ NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadMochiModel": DownloadAndLoadMochiModel,
     "MochiSampler": MochiSampler,
     "MochiDecode": MochiDecode,
+    "MochiDecodeOptimized": OptimizedMochiDecode,
     "MochiTextEncode": MochiTextEncode,
     "MochiModelLoader": MochiModelLoader,
     "MochiVAELoader": MochiVAELoader,
@@ -586,6 +770,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadMochiModel": "(Down)load Mochi Model",
     "MochiSampler": "Mochi Sampler",
     "MochiDecode": "Mochi Decode",
+    "MochiDecodeOptimized": "Mochi Decode Optimized",
     "MochiTextEncode": "Mochi TextEncode",
     "MochiModelLoader": "Mochi Model Loader",
     "MochiVAELoader": "Mochi VAE Loader",
@@ -600,5 +785,7 @@ NODE_CLASS_MAPPINGS.update({
 NODE_DISPLAY_NAME_MAPPINGS.update({
     "MochiImageEncode": "Mochi Image Encode",
 })
+
+
 
 
